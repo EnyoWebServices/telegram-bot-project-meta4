@@ -228,6 +228,7 @@
     const errorMessage = document.getElementById("joinError");
 
     let requestInProgress = false;
+    let inviteLinkRequest = null;
 
     // Read browser cookies
     function getCookie(name) {
@@ -266,6 +267,53 @@
       };
     }
 
+    // Share one request between background preloading and button clicks.
+    function getInviteLink() {
+      if (!inviteLinkRequest) {
+        inviteLinkRequest = (async function () {
+          const response = await fetch(
+            API_URL + "/api/create-invite-by-bot",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(getAttribution())
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(
+              "Invite API returned status " + response.status
+            );
+          }
+
+          const data = await response.json();
+          const inviteLink = data.inviteLink;
+
+          if (
+            typeof inviteLink !== "string" ||
+            !/^https:\/\/t\.me\//i.test(inviteLink)
+          ) {
+            throw new Error("Invalid Telegram invite link");
+          }
+
+          return inviteLink;
+        })().catch(error => {
+          inviteLinkRequest = null;
+          throw error;
+        });
+      }
+
+      return inviteLinkRequest;
+    }
+
+    function prefetchInviteLink() {
+      getInviteLink().catch(error => {
+        console.error("Background invite prefetch failed:", error);
+      });
+    }
+
     // Reset the button after returning to the website
     function resetJoinButton() {
       requestInProgress = false;
@@ -277,12 +325,14 @@
     // Restore button when page is shown again
     window.addEventListener("pageshow", function () {
       resetJoinButton();
+      prefetchInviteLink();
     });
 
     // Restore button when user returns from Telegram/app
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) {
         resetJoinButton();
+        prefetchInviteLink();
       }
     });
 
@@ -296,33 +346,8 @@
       buttonText.textContent = "PLEASE WAIT...";
 
       try {
-        const response = await fetch(
-          API_URL + "/api/create-invite-by-bot",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(getAttribution())
-          }
-        );
-
-        if (!response.ok) {
-          throw new Error(
-            "Invite API returned status " + response.status
-          );
-        }
-
-        const data = await response.json();
-        const inviteLink = data.inviteLink;
-
-        // Accept Telegram invite links only
-        if (
-          typeof inviteLink !== "string" ||
-          !/^https:\/\/t\.me\//i.test(inviteLink)
-        ) {
-          throw new Error("Invalid Telegram invite link");
-        }
+        const inviteLink = await getInviteLink();
+        inviteLinkRequest = null;
 
         // Open Telegram in the current tab
         window.location.assign(inviteLink);
@@ -336,6 +361,9 @@
         errorMessage.hidden = false;
       }
     });
+
+    // Start generating the attributed invite before the visitor clicks.
+    prefetchInviteLink();
   </script>
 </body>
 </html>
