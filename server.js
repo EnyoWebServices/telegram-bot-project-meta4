@@ -15,20 +15,32 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "20kb" }));
 
-const allowedOrigins = [
-  "http://localhost:5500",
-  "http://127.0.0.1:5500",
-  "http://localhost:3000",
-  "https://badshah-broking-official-btt2.vercel.app",
-  "https://badshah-broking-official-btt2.onrender.com",
-  "https://goutam-jha-official-dhnrj.vercel.app",
-];
+// --------------------
+// Environment configuration
+// --------------------
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(origin, callback) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin.replace(/\/+$/, ""))
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not allowed by CORS"));
+    },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: [
+      "Content-Type",
+      "X-Telegram-Bot-Api-Secret-Token",
+    ],
   })
 );
 
@@ -45,7 +57,7 @@ app.get("/", (req, res) => {
 });
 
 // --------------------
-// Rate limit
+// Rate limiting
 // --------------------
 
 const inviteLimiter = rateLimit({
@@ -56,7 +68,7 @@ const inviteLimiter = rateLimit({
 });
 
 // --------------------
-// Create unique invite + save attribution data
+// Create unique Telegram invite
 // --------------------
 
 app.post("/api/create-invite-by-bot", inviteLimiter, async (req, res) => {
@@ -70,19 +82,21 @@ app.post("/api/create-invite-by-bot", inviteLimiter, async (req, res) => {
       });
     }
 
-    const inviteId = randomUUID();
-
-    // Only accept strings of reasonable length.
     const cleanIdentifier = (value, maxLength = 500) => {
       if (typeof value !== "string") return null;
+
       const trimmed = value.trim();
+
       if (!trimmed || trimmed.length > maxLength) return null;
+
       return trimmed;
     };
 
     const fbp = cleanIdentifier(req.body?.fbp);
     const fbc = cleanIdentifier(req.body?.fbc);
     const campaignId = cleanIdentifier(req.body?.campaignId, 100);
+
+    const inviteId = randomUUID();
 
     const telegramResponse = await fetch(
       `https://api.telegram.org/bot${token}/createChatInviteLink`,
@@ -141,9 +155,7 @@ app.post("/api/create-invite-by-bot", inviteLimiter, async (req, res) => {
 });
 
 // --------------------
-// Existing shared invite endpoint
-// Note: this endpoint does not associate a visitor
-// with a unique invite record.
+// Shared invite endpoint
 // --------------------
 
 app.post("/api/create-invite", (req, res) => {
@@ -166,9 +178,14 @@ async function sendMetaJoinEvent(request, channelId, userId, attribution = {}) {
   const pixelId = process.env.META_PIXEL_ID;
   const accessToken = process.env.META_CAPI_ACCESS_TOKEN;
   const testEventCode = process.env.META_TEST_EVENT_CODE?.trim();
+  const appUrl = process.env.APP_URL?.trim().replace(/\/+$/, "");
 
   if (!pixelId || !accessToken) {
     throw new Error("Meta CAPI environment variables are missing");
+  }
+
+  if (!appUrl) {
+    throw new Error("APP_URL environment variable is missing");
   }
 
   const eventId = `telegram_join_${channelId}_${userId}`;
@@ -181,22 +198,17 @@ async function sendMetaJoinEvent(request, channelId, userId, attribution = {}) {
     external_id: [hashedUserId],
   };
 
-  // Include Meta browser identifiers only when available.
-  if (attribution.fbp) {
-    userData.fbp = attribution.fbp;
-  }
-
-  if (attribution.fbc) {
-    userData.fbc = attribution.fbc;
-  }
+  if (attribution.fbp) userData.fbp = attribution.fbp;
+  if (attribution.fbc) userData.fbc = attribution.fbc;
 
   const payload = {
     data: [
       {
         event_name: "Join",
-        event_time: Math.floor(request.date),
+        event_time: Math.floor(Number(request.date)),
         event_id: eventId,
-        action_source: "chat",
+        action_source: "website",
+        event_source_url: appUrl,
         user_data: userData,
       },
     ],
@@ -207,7 +219,7 @@ async function sendMetaJoinEvent(request, channelId, userId, attribution = {}) {
   }
 
   const metaResponse = await fetch(
-    `https://graph.facebook.com/v23.0/${pixelId}/events?access_token=${encodeURIComponent(accessToken)}`,
+    `https://graph.facebook.com/v23.0/${encodeURIComponent(pixelId)}/events?access_token=${encodeURIComponent(accessToken)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -253,11 +265,11 @@ app.post("/telegram-webhook", async (req, res) => {
     return res.sendStatus(403);
   }
 
-  // Acknowledge Telegram immediately.
+  // Acknowledge Telegram before processing.
   res.sendStatus(200);
 
   try {
-    const request = req.body.chat_join_request;
+    const request = req.body?.chat_join_request;
 
     if (!request) return;
 
@@ -269,7 +281,6 @@ app.post("/telegram-webhook", async (req, res) => {
       return;
     }
 
-    // Find the exact invite used for this join request.
     const telegramInviteUrl = request.invite_link?.invite_link;
 
     let inviteRecord = null;
@@ -288,7 +299,6 @@ app.post("/telegram-webhook", async (req, res) => {
       }
     }
 
-    // Preserve existing duplicate protection.
     try {
       await JoinRequest.create({
         channelId,
@@ -346,6 +356,35 @@ app.get("/health", (req, res) => {
 });
 
 // --------------------
+// Keep-alive using environment URL
+// --------------------
+
+async function pingKeepAliveUrl() {
+  const keepAliveUrl = process.env.KEEP_ALIVE_URL?.trim();
+
+  if (!keepAliveUrl) {
+    console.log("Keep-alive disabled: KEEP_ALIVE_URL is not configured.");
+    return;
+  }
+
+  try {
+    const response = await fetch(keepAliveUrl, {
+      method: "GET",
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      console.error("Keep-alive request failed:", response.status);
+      return;
+    }
+
+    console.log("Keep-alive ping successful:", response.status);
+  } catch (error) {
+    console.error("Keep-alive request failed:", error.message);
+  }
+}
+
+// --------------------
 // Start server
 // --------------------
 
@@ -360,24 +399,14 @@ async function startServer() {
 
     const port = process.env.PORT || 3000;
 
-    app.listen(port, () => {
+    app.listen(port, "0.0.0.0", () => {
       console.log(`Server running on port ${port}`);
 
-      setInterval(async () => {
-        try {
-          const response = await fetch(
-            "https://telegram-bot-project-iqzg.onrender.com/",
-            { signal: AbortSignal.timeout(10000) }
-          );
+      // First ping after startup, then every 10 minutes.
+      void pingKeepAliveUrl();
 
-          if (!response.ok) {
-            console.error("Keep-alive request failed:", response.status);
-          }
-
-          await response.text();
-        } catch (error) {
-          console.error("Keep-alive request failed:", error.message);
-        }
+      setInterval(() => {
+        void pingKeepAliveUrl();
       }, 10 * 60 * 1000);
     });
   } catch (error) {
